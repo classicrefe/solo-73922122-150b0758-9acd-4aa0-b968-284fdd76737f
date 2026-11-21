@@ -35,6 +35,45 @@ s.t.  A w = p                # 每行一个目标人群，A 为 0/1 成员矩阵
 - 进程重启后，未完成作业标记为 `interrupted`；`GET /result` 仅提供与当前
   输入逐字段一致的完整结果，否则返回 `409`。
 
+## 地区对照报告：共用年龄分组（`POST /age-grouping`）
+
+回访问卷的地区对照报告需要一套所有地区共用的年龄分组，避免拿有效样本过少
+的组作比较。接口接收一个**有效的成功校准作业号**，直接使用该作业快照中的
+样本与逐人校正权重 `w` 计算，不重新求解。
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `job_id` | 成功（`succeeded`）作业号；不存在、已失效或非成功状态一律 `409` |
+| `age_group_order` | 作业快照中各年龄段的顺序，集合必须与快照完全一致，否则 `422` |
+| `keep_boundaries` | 必须保留的分界：列出的每个年龄段之后强制切开，两侧不得并入同一组 |
+| `min_effective_sample_size` | 最低有效样本量（正数） |
+
+规则与算法：
+
+- **只合并相邻年龄段**，且保留分界两侧永远不会落入同一组；
+- 每个地区在每个合并组上都必须达标。格内有效样本量用个人权重计算
+  Kish 公式 **ESS = (Σw)² / Σ(w²)**，没有样本的空格计 `0`；
+- 动态规划求**组数最多**的完整分法（组数相同时切点尽量靠前，结果确定）；
+- 若不存在覆盖全部年龄段的完整分法，按保留分界把年龄段切成区间，
+  逐区间返回 `ungroupable_segments`（含段内各原子格 ESS 与整段 ESS），
+  **不返回任何部分方案**（`groups` 为空）；
+- 无论可行与否，响应都带全部原子 (地区, 年龄段) 格的 `atomic_cell_ess`，
+  便于核对合并前后的有效样本量。
+
+### 分组自测（能分组 / 不能分组）
+
+```bash
+# 先 docker compose up --build，然后：
+python3 examples/grouping_demo.py                      # 默认 http://127.0.0.1:8000
+python3 examples/grouping_demo.py http://host:8000
+```
+
+也可在 Swagger UI（`/docs`）中对 `POST /age-grouping` 直接试调，请求体模板见
+`examples/grouping_feasible_request.json`（能分组）与
+`examples/grouping_infeasible_request.json`（保留分界后无法分组）。
+
 ## 快速启动（Docker Compose）
 
 ```bash
@@ -66,6 +105,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/jobs/{job_id}` | 查询作业；成功时含完整权重与输入快照 |
 | GET | `/jobs` | 最近作业列表 |
 | GET | `/result` | 取用与当前输入一致的完整权重，否则 409 |
+| POST | `/age-grouping` | 基于成功作业求共用年龄分组；失败作业/失效作业号 409 |
 | GET | `/health` | 健康检查 |
 
 输入为严格整数：`d` 必须是 1–100 的整数（布尔值、小数、越界均 422），

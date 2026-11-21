@@ -1,0 +1,5 @@
+{
+  "age_group_order": ["youth", "mid", "senior", "elder"],
+  "keep_boundaries": ["youth"],
+  "min_effective_sample_size": 2
+}

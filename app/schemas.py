@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MAX_SAMPLES = 200
 MAX_TARGETS = 12
@@ -126,3 +126,140 @@ class JobResult(BaseModel):
     target_totals: list[TargetTotalsItem] | None = None
     # status=infeasible 时给出最小冲突目标子集
     infeasible_targets: list[dict] | None = None
+
+
+# ============================================================
+# 地区对照报告：共用年龄分组
+# ====================================================
+
+class AgeGroupingRequest(StrictModel):
+    job_id: str = Field(description="有效的成功校准作业号（status=succeeded）")
+    age_group_order: list[str] = Field(
+        description="作业快照中各年龄段的顺序；必须与快照中的年龄段集合完全一致"
+    )
+    keep_boundaries: list[str] = Field(
+        default_factory=list,
+        description=(
+            "必须保留的分界：列出的每个年龄段之后强制切开，"
+            "其两侧年龄段不得并入同一组；不允许使用最后一个年龄段"
+        ),
+    )
+    min_effective_sample_size: float = Field(
+        description="最低有效样本量，正数；每个地区在每个合并组都须达到该值"
+    )
+
+    _v_job = _strict_code("job_id")
+
+    @field_validator("age_group_order")
+    @classmethod
+    def _v_order(cls, v: list[str]):
+        if not v:
+            raise ValueError("age_group_order 至少包含一个年龄段")
+        cleaned: list[str] = []
+        for code in v:
+            if isinstance(code, bool) or not isinstance(code, str):
+                raise ValueError("年龄段代码必须是字符串")
+            code = code.strip()
+            if not code:
+                raise ValueError("年龄段代码不能为空字符串")
+            if len(code) > MAX_CODE_LEN:
+                raise ValueError(f"年龄段代码长度须 <= {MAX_CODE_LEN}")
+            cleaned.append(code)
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("age_group_order 中存在重复年龄段")
+        return cleaned
+
+    @field_validator("keep_boundaries")
+    @classmethod
+    def _v_boundaries(cls, v: list[str]):
+        cleaned: list[str] = []
+        for code in v:
+            if isinstance(code, bool) or not isinstance(code, str):
+                raise ValueError("保留分界必须是年龄段代码字符串")
+            code = code.strip()
+            if not code:
+                raise ValueError("保留分界不能为空字符串")
+            if len(code) > MAX_CODE_LEN:
+                raise ValueError(f"保留分界代码长度须 <= {MAX_CODE_LEN}")
+            cleaned.append(code)
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("keep_boundaries 中存在重复分界")
+        return cleaned
+
+    @field_validator("min_effective_sample_size", mode="before")
+    @classmethod
+    def _v_min_ess(cls, v):
+        # 在 Pydantic 强转之前拦截：布尔是 int 子类，不拦截会被当成 1.0
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("min_effective_sample_size 必须是正数")
+        if v <= 0:
+            raise ValueError("min_effective_sample_size 必须 > 0")
+        return float(v)
+
+    @model_validator(mode="after")
+    def _cross_check(self):
+        unknown = [b for b in self.keep_boundaries
+                   if b not in self.age_group_order]
+        if unknown:
+            raise ValueError(
+                "keep_boundaries 含 age_group_order 中不存在的年龄段: "
+                + ", ".join(unknown)
+            )
+        if self.age_group_order[-1] in self.keep_boundaries:
+            raise ValueError(
+                "最后一个年龄段之后没有分界，不能把它列为 keep_boundaries"
+            )
+        return self
+
+
+class CellESSOut(BaseModel):
+    region: str
+    age_group: str
+    effective_sample_size: float
+    sample_count: int
+    meets_threshold: bool
+
+
+class GroupCellESSOut(BaseModel):
+    region: str
+    effective_sample_size: float
+    sample_count: int
+    meets_threshold: bool
+
+
+class AgeGroupBlockOut(BaseModel):
+    group_index: int
+    age_groups: list[str]
+    cut_after_last: bool
+    cells: list[GroupCellESSOut]
+
+
+class WholeSegmentESSOut(BaseModel):
+    region: str
+    effective_sample_size: float
+    sample_count: int
+    meets_threshold: bool
+
+
+class UngroupableSegmentOut(BaseModel):
+    segment_index: int
+    age_groups: list[str]
+    # 段内每个原子年龄段 × 地区的格内 ESS（空格计 0），用于定位短板
+    cell_ess: list[CellESSOut]
+    whole_segment_ess: list[WholeSegmentESSOut]
+
+
+class AgeGroupingResponse(BaseModel):
+    job_id: str
+    feasible: bool
+    age_group_order: list[str]
+    regions: list[str]
+    keep_boundaries: list[str]
+    min_effective_sample_size: float
+    # feasible=True：组数最多的完整分法；feasible=False 为空列表，
+    # 不返回任何部分方案
+    groups: list[AgeGroupBlockOut]
+    # feasible=False：按保留分界切开后无法分组的区间；feasible=True 为空
+    ungroupable_segments: list[UngroupableSegmentOut]
+    # 全部原子 (地区, 年龄段) 格的 ESS，两种情形都返回
+    atomic_cell_ess: list[CellESSOut]

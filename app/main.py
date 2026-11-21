@@ -11,12 +11,20 @@ from fastapi.responses import JSONResponse
 
 from .db import Database
 from .jobs import JobManager
+from .grouping import plan_grouping
 from .schemas import (
+    AgeGroupingRequest,
+    AgeGroupingResponse,
+    AgeGroupBlockOut,
+    CellESSOut,
+    GroupCellESSOut,
     JobResult,
     SamplesPayload,
     TargetsPayload,
     TargetTotalsItem,
+    UngroupableSegmentOut,
     WeightItem,
+    WholeSegmentESSOut,
 )
 
 DB_PATH = os.environ.get("WEIGHTS_DB", "/data/weights.db")
@@ -167,6 +175,135 @@ def get_result():
         # 理论上不会发生（epoch 变更即清除作业），双保险
         raise HTTPException(409, "结果与当前输入不一致，已拒绝取用，请重新计算")
     return data
+
+
+# ---------------------------------------------------------------- 年龄分组
+@app.post(
+    "/age-grouping",
+    response_model=AgeGroupingResponse,
+    tags=["地区对照分组"],
+    summary=(
+        "为地区对照报告求共用年龄分组：只合并相邻年龄段、保留指定分界，"
+        "每个地区在每个合并组均达到最低有效样本量"
+    ),
+)
+def age_grouping(payload: AgeGroupingRequest):
+    row = db().get_job(payload.job_id)
+    if row is None:
+        # 作业不存在，或已因输入变更被永久删除（失效）
+        raise HTTPException(409, "作业不存在或已因输入变更而永久失效")
+    if row["status"] != "succeeded":
+        raise HTTPException(
+            409,
+            f"作业状态为 {row['status']}，仅成功（succeeded）作业可用于年龄分组",
+        )
+
+    snapshot = json.loads(row["input_snapshot"])
+    samples = snapshot["samples"]
+    result = json.loads(row["result"]) if row["result"] else None
+    if not result or "weights" not in result:
+        # 双保险：成功作业必须带完整权重，否则视为无完整结果
+        raise HTTPException(409, "作业缺少完整权重结果，无法用于年龄分组")
+
+    # 年龄段顺序必须与作业快照中的年龄段集合完全一致（顺序由请求给定）
+    snapshot_ages = {s["age_group"] for s in samples}
+    if set(payload.age_group_order) != snapshot_ages or \
+            len(payload.age_group_order) != len(snapshot_ages):
+        raise HTTPException(
+            422,
+            "age_group_order 必须与作业快照中的年龄段集合完全一致；"
+            f"快照年龄段={sorted(snapshot_ages)}",
+        )
+
+    weights_by_person = {item["person_id"]: float(item["w"])
+                         for item in result["weights"]}
+    # 地区按其在快照中首次出现的顺序排列，保证输出确定性
+    regions: list[str] = []
+    for s in samples:
+        if s["region"] not in regions:
+            regions.append(s["region"])
+
+    # 汇总每个 (地区, 年龄段) 格内的个人权重
+    cell_weights: dict[tuple[str, str], list[float]] = {}
+    for s in samples:
+        w = weights_by_person.get(s["person_id"])
+        if w is None:
+            raise HTTPException(409, "作业结果缺少样本权重，无法用于年龄分组")
+        cell_weights.setdefault((s["region"], s["age_group"]), []).append(w)
+
+    plan = plan_grouping(
+        age_order=payload.age_group_order,
+        regions=regions,
+        cell_weights=cell_weights,
+        keep_boundaries=payload.keep_boundaries,
+        min_ess=payload.min_effective_sample_size,
+    )
+
+    atomic = [
+        CellESSOut(
+            region=c.region,
+            age_group=c.age_group,
+            effective_sample_size=c.ess,
+            sample_count=c.sample_count,
+            meets_threshold=c.meets_threshold,
+        )
+        for c in plan.atomic_cell_ess
+    ]
+    groups_out = [
+        AgeGroupBlockOut(
+            group_index=g.group_index,
+            age_groups=g.age_groups,
+            cut_after_last=g.cut_after_last,
+            cells=[
+                GroupCellESSOut(
+                    region=x.region,
+                    effective_sample_size=x.ess,
+                    sample_count=x.sample_count,
+                    meets_threshold=x.meets_threshold,
+                )
+                for x in g.cells
+            ],
+        )
+        for g in plan.groups
+    ]
+    segments_out = [
+        UngroupableSegmentOut(
+            segment_index=seg.segment_index,
+            age_groups=seg.age_groups,
+            cell_ess=[
+                CellESSOut(
+                    region=c.region,
+                    age_group=c.age_group,
+                    effective_sample_size=c.ess,
+                    sample_count=c.sample_count,
+                    meets_threshold=c.meets_threshold,
+                )
+                for c in seg.cell_ess
+            ],
+            whole_segment_ess=[
+                WholeSegmentESSOut(
+                    region=x.region,
+                    effective_sample_size=x.ess,
+                    sample_count=x.sample_count,
+                    meets_threshold=x.meets_threshold,
+                )
+                for x in seg.whole_segment_ess
+            ],
+        )
+        for seg in plan.ungroupable_segments
+    ]
+
+    return AgeGroupingResponse(
+        job_id=payload.job_id,
+        feasible=plan.feasible,
+        age_group_order=plan.age_group_order,
+        regions=plan.regions,
+        keep_boundaries=plan.keep_boundaries,
+        min_effective_sample_size=plan.min_ess,
+        groups=groups_out,
+        ungroupable_segments=segments_out,
+        atomic_cell_ess=atomic,
+    )
 
 
 @app.get("/health", tags=["系统"], summary="健康检查")
